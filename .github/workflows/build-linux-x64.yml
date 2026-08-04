@@ -60,11 +60,19 @@ jobs:
           CODEG_SKIP_SIDECAR: "1"
         run: pnpm tauri build --target x86_64-unknown-linux-gnu --no-bundle
 
+      - name: Package runnable artifact
+        run: |
+          mkdir -p dist/codeg-linux-x64
+          cp src-tauri/target/x86_64-unknown-linux-gnu/release/codeg \
+            dist/codeg-linux-x64/codeg
+          cp src-tauri/binaries/codeg-mcp-x86_64-unknown-linux-gnu \
+            dist/codeg-linux-x64/codeg-mcp
+          chmod +x dist/codeg-linux-x64/codeg dist/codeg-linux-x64/codeg-mcp
+          tar -C dist -czf dist/codeg-linux-x64.tar.gz codeg-linux-x64
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: codeg-linux-x64
-          path: |
-            src-tauri/target/x86_64-unknown-linux-gnu/release/codeg
-            src-tauri/binaries/codeg-mcp-x86_64-unknown-linux-gnu
+          path: dist/codeg-linux-x64.tar.gz
           if-no-files-found: error
