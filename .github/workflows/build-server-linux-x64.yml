@@ -1,0 +1,86 @@
+name: Build Server Linux x64
+
+on:
+  workflow_dispatch:
+
+env:
+  RUST_BACKTRACE: short
+  HUSKY: 0
+
+jobs:
+  build:
+    name: Build server Linux x64
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: server-linux-x64-manual
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libssl-dev
+
+      - name: Build frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Build server and codeg-mcp
+        working-directory: src-tauri
+        run: |
+          cargo build --release --bin codeg-server --no-default-features --target x86_64-unknown-linux-gnu
+          cargo build --release --bin codeg-mcp --no-default-features --target x86_64-unknown-linux-gnu
+
+      - name: Package server artifact
+        run: |
+          mkdir -p dist/codeg-server-linux-x64
+          cp src-tauri/target/x86_64-unknown-linux-gnu/release/codeg-server \
+            dist/codeg-server-linux-x64/codeg-server
+          cp src-tauri/target/x86_64-unknown-linux-gnu/release/codeg-mcp \
+            dist/codeg-server-linux-x64/codeg-mcp
+          cp -r out dist/codeg-server-linux-x64/web
+          chmod +x \
+            dist/codeg-server-linux-x64/codeg-server \
+            dist/codeg-server-linux-x64/codeg-mcp
+          tar -C dist -czf dist/codeg-server-linux-x64.tar.gz codeg-server-linux-x64
+
+      - name: Smoke test packaged artifact
+        run: |
+          set -euo pipefail
+          test -x dist/codeg-server-linux-x64/codeg-server
+          test -x dist/codeg-server-linux-x64/codeg-mcp
+          test -f dist/codeg-server-linux-x64/web/index.html
+          dist/codeg-server-linux-x64/codeg-server --version
+          dist/codeg-server-linux-x64/codeg-mcp --help | grep -F 'codeg-mcp --parent-connection-id'
+
+      - name: Upload server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeg-server-linux-x64
+          path: dist/codeg-server-linux-x64.tar.gz
+          if-no-files-found: error
