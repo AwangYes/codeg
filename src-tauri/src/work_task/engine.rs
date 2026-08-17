@@ -1074,16 +1074,37 @@ impl TaskEngine {
         let conversation_id = if resumed {
             task.conversation_id.expect("resumed implies conversation")
         } else {
-            let title = first_chars(task.title.trim(), 80);
-            match create_conversation_core(&self.db.conn, wt.folder_id, agent_type, Some(title))
-                .await
+            let title = conversation_title_for_task(&task.title);
+            let id = match create_conversation_core(
+                &self.db.conn,
+                wt.folder_id,
+                agent_type,
+                Some(title),
+            )
+            .await
             {
                 Ok(id) => id,
                 Err(e) => {
                     let _ = self.manager.disconnect(&conn_id).await;
                     return Err(e.to_string());
                 }
+            };
+            // The card's name IS this session's identity — freeze it the way a
+            // manual rename would, or the per-turn auto-title backfill replaces
+            // it with whatever the agent's session file parses to (for agents
+            // with no title of their own: the first line of the composed
+            // prompt, e.g. "项目：/Users/…"). Issue #495.
+            //
+            // Strictly before the upsert below: that broadcast is how any
+            // client first learns this id, so locking first makes a backfill on
+            // this row impossible rather than merely unlikely. A failure here
+            // only costs the nice title — never the launch.
+            if let Err(e) = conversation_service::lock_title(&self.db.conn, id).await {
+                tracing::warn!(
+                    "[work_task] task {task_id}: could not lock conversation {id} title: {e}"
+                );
             }
+            id
         };
         emit_conversation_upsert(&self.emitter, &self.db.conn, conversation_id).await;
 
@@ -4148,6 +4169,22 @@ fn first_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Cap on a task-derived conversation title. Long enough for a real card name,
+/// short enough that the sidebar row is not one giant ellipsis.
+const CONVERSATION_TITLE_MAX_CHARS: usize = 80;
+
+/// The title the session a task produces carries: the task's own name, capped.
+/// It is LOCKED on the conversation row at launch (`conversation_service::
+/// lock_title`), so a board card and the session it spawned always read the
+/// same in the sidebar (issue #495).
+///
+/// One definition, because two callers must agree byte-for-byte: the launch-time
+/// seed here, and the rename propagation in `commands::work_task`, which
+/// recognises "still the task's name" by comparing against this exact value.
+pub(crate) fn conversation_title_for_task(task_title: &str) -> String {
+    first_chars(task_title.trim(), CONVERSATION_TITLE_MAX_CHARS)
+}
+
 /// The project folder's own name — what a task worktree directory is named
 /// after. `Path` semantics rather than a `/` split, so `C:\src\repo` yields
 /// `repo` too.
@@ -4332,23 +4369,20 @@ mod tests {
     fn a_configured_root_holds_one_directory_per_task() {
         let root = format!("{ABS_PREFIX}/home/me/repo");
         let trees = format!("{ABS_PREFIX}/var/worktrees");
-        let at = |name: &str| {
-            Path::new(&trees)
-                .join(name)
-                .to_string_lossy()
-                .into_owned()
+        // Compared as paths, not strings: a separator the setting carried in
+        // survives into the result — `Path::join` reuses a trailing one rather
+        // than adding its own — and on Windows `/` and `\` are the same
+        // separator. Only the directory the worktree lands in is pinned here,
+        // never the spelling of the separators.
+        let at = |name: &str| Path::new(&trees).join(name);
+        let landed = |setting: &str, name: &str| {
+            PathBuf::from(worktree_path_in_home(&root, Some(setting), name, None))
         };
-        assert_eq!(
-            worktree_path_in_home(&root, Some(&trees), "repo-task-7", None),
-            at("repo-task-7")
-        );
-        assert_eq!(
-            worktree_path_in_home(&root, Some(&trees), "repo-task-8", None),
-            at("repo-task-8")
-        );
+        assert_eq!(landed(&trees, "repo-task-7"), at("repo-task-7"));
+        assert_eq!(landed(&trees, "repo-task-8"), at("repo-task-8"));
         // Typed paths arrive with stray whitespace and trailing separators.
         assert_eq!(
-            worktree_path_in_home(&root, Some(&format!("  {trees}/  ")), "repo-task-7", None),
+            landed(&format!("  {trees}/  "), "repo-task-7"),
             at("repo-task-7")
         );
     }
