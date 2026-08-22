@@ -63,13 +63,17 @@ import {
   FolderSelect,
   type FolderSelectOption,
 } from "@/components/shared/folder-select"
+import { ForgeBetaBadge } from "@/components/forge/forge-beta-badge"
+import { OPEN_FORGE_SETTINGS_EVENT } from "@/components/forge/forge-chrome-actions"
 import { ForgeIssueRowItem } from "@/components/forge/forge-issue-row"
+import { ForgeSettingsDialog } from "@/components/forge/forge-settings-dialog"
 import { ForgeStartDialog } from "@/components/forge/forge-start-dialog"
 import { useIsMobile } from "@/hooks/use-mobile"
 import {
   folderForgeRemote,
   forgeListIssues,
   forgeListLabels,
+  forgeSettingsGet,
   forgeTabCount,
   openSettingsWindow,
   workTaskLookupBySource,
@@ -87,6 +91,7 @@ import {
   type ForgePageSize,
 } from "@/lib/forge-list-prefs"
 import { pageCount, pageSlots } from "@/lib/forge-pagination"
+import { effectiveForgeSettings } from "@/lib/forge-settings"
 import { openUrl, subscribe } from "@/lib/platform"
 import { cn } from "@/lib/utils"
 import type {
@@ -96,6 +101,7 @@ import type {
   ForgeRemote,
   ForgeSort,
   ForgeTab,
+  ForgeSettingsStore,
   ForgeTaskLink,
 } from "@/lib/types"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -103,6 +109,18 @@ import { useForgeRefreshStore } from "@/stores/forge-refresh-store"
 
 const WORK_TASK_CHANGED_EVENT = "task://changed"
 const FOLDER_STORAGE_KEY = "forge:folderId"
+
+/** Separates label names inside the counts scope key, so that a label carrying
+ *  the outer `:` cannot make two different filter sets read as one scope.
+ *
+ *  Built at runtime rather than written as an escape sequence, because this
+ *  file is where the alternative was found in the wild: the escape had landed
+ *  as a real NUL byte, and nothing complained. It compiled, the tests passed,
+ *  and git kept diffing it as text — git sniffs only the first few thousand
+ *  bytes for NUL, and this one sat well past that. What it did break was
+ *  search: grep and rg classify the whole file as binary and return no
+ *  matches, so every symbol in here read as one that does not exist. */
+const LABEL_SCOPE_SEP = String.fromCharCode(0)
 
 /** Must mirror `NO_ACCOUNT_I18N_KEY` in src-tauri/src/forge/mod.rs. The key —
  *  not the error `code` — is the discriminator: `configuration_missing` is a
@@ -233,7 +251,7 @@ export function repoWebUrl(remote: ForgeRemote): string {
 
 export function ForgePageTitle() {
   const t = useTranslations("Forge")
-  return <WorkbenchPageTitle title={t("title")} />
+  return <WorkbenchPageTitle title={t("title")} badge={<ForgeBetaBadge />} />
 }
 
 function loadStoredFolderId(): number | null {
@@ -305,6 +323,14 @@ export function ForgePage() {
   const [error, setError] = useState<ListFailure | null>(null)
   const [links, setLinks] = useState<Map<string, ForgeTaskLink>>(new Map())
   const [startRow, setStartRow] = useState<ForgeIssueRow | null>(null)
+  /** The panel's preferences, EVERY scope — what a trigger dialog OPENS with,
+   *  and nothing else this page reads. Loaded once and replaced in place when
+   *  the settings dialog saves; `null` means "not loaded yet, or the read
+   *  failed", which the trigger dialog treats as the built-in defaults rather
+   *  than as a reason to wait. Held as the whole store rather than as one
+   *  folder's resolved values so switching folders costs no round trip. */
+  const [settings, setSettings] = useState<ForgeSettingsStore | null>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const [labelOptions, setLabelOptions] = useState<ForgeLabel[]>([])
   const [labelsTruncated, setLabelsTruncated] = useState(false)
   const reqRef = useRef(0)
@@ -356,7 +382,7 @@ export function ForgePage() {
   const listScope = `${effectiveFolderId}:${tab}`
   /** Which RESULT SET the badges count — see [`TabCounts`]. No tab, no page,
    *  no order: none of the three can change either number. */
-  const countsScope = `${effectiveFolderId}:${stateFilter}:${assignedMe}:${labelFilter.join(" ")}:${search}`
+  const countsScope = `${effectiveFolderId}:${stateFilter}:${assignedMe}:${labelFilter.join(LABEL_SCOPE_SEP)}:${search}`
   /** The only tab a probe is ever spent on. */
   const otherTab: ForgeTab = tab === "issues" ? "prs" : "issues"
 
@@ -561,6 +587,27 @@ export function ForgePage() {
   // Only on unmount: leaving a handler behind would give the next route's
   // chrome a live button pointing at a page that no longer exists.
   useEffect(() => () => withdrawRefresh(), [withdrawRefresh])
+
+  // The chrome cluster's gear, and the preferences it edits. One read for the
+  // page's whole life: the store holds every scope, it only changes through the
+  // dialog next to this listener, and that dialog hands the stored values
+  // straight back. A failure is silent on purpose — the trigger dialog falls
+  // back to the built-in defaults, and a toast about preferences nobody asked
+  // for yet would be noise over a page that works.
+  useEffect(() => {
+    let cancelled = false
+    forgeSettingsGet()
+      .then((s) => {
+        if (!cancelled) setSettings(s)
+      })
+      .catch(() => {})
+    const open = () => setSettingsOpen(true)
+    window.addEventListener(OPEN_FORGE_SETTINGS_EVENT, open)
+    return () => {
+      cancelled = true
+      window.removeEventListener(OPEN_FORGE_SETTINGS_EVENT, open)
+    }
+  }, [])
 
   // The typed text becomes a request only once typing stops. `search` is in the
   // dependency list so the settled value short-circuits the next run instead of
@@ -995,6 +1042,9 @@ export function ForgePage() {
           row={startRow}
           remote={remote}
           folderId={effectiveFolderId}
+          // Resolved for the folder on screen: its own panel settings if it has
+          // any, else the global row (see `effectiveForgeSettings`).
+          settings={effectiveForgeSettings(settings, effectiveFolderId)}
           onClose={() => setStartRow(null)}
           onCreated={() => {
             setStartRow(null)
@@ -1002,6 +1052,19 @@ export function ForgePage() {
           }}
         />
       ) : null}
+
+      <ForgeSettingsDialog
+        open={settingsOpen}
+        onOpenChange={setSettingsOpen}
+        // Opens on the folder whose list you were looking at — the scope you
+        // are almost certainly there to change — with the picker inside to go
+        // global or elsewhere.
+        folderId={effectiveFolderId}
+        // Kept in the page rather than re-fetched: the next trigger dialog
+        // opens on what was just saved, and the read that seeded this page may
+        // have happened minutes ago.
+        onSaved={setSettings}
+      />
     </div>
   )
 }
